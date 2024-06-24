@@ -5,8 +5,7 @@ cmake_minimum_required(VERSION 3.14...3.22)
 project(
   mruby
   VERSION 3.2.0
-  # LANGUAGES C
-  LANGUAGES CXX
+  LANGUAGES C
 )
 
 # ---- Include guards ----
