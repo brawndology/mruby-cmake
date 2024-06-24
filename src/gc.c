@@ -190,10 +190,12 @@ mrb_realloc_simple(mrb_state *mrb, void *p,  size_t len)
   void *p2;
 
 #if defined(MRB_GC_STRESS) && defined(MRB_DEBUG)
-  mrb_full_gc(mrb);
+  if (mrb->gc.state != MRB_GC_STATE_SWEEP) {
+    mrb_full_gc(mrb);
+  }
 #endif
   p2 = (mrb->allocf)(mrb, p, len, mrb->allocf_ud);
-  if (!p2 && len > 0 && mrb->gc.heaps) {
+  if (!p2 && len > 0 && mrb->gc.heaps && mrb->gc.state != MRB_GC_STATE_SWEEP) {
     mrb_full_gc(mrb);
     p2 = (mrb->allocf)(mrb, p, len, mrb->allocf_ud);
   }
@@ -266,7 +268,7 @@ mrb_alloca(mrb_state *mrb, size_t size)
 }
 
 static mrb_bool
-heap_p(mrb_gc *gc, struct RBasic *object)
+heap_p(mrb_gc *gc, const struct RBasic *object)
 {
   mrb_heap_page* page;
 
@@ -576,9 +578,11 @@ mark_context(mrb_state *mrb, struct mrb_context *c)
   }
 }
 
-static void
+static size_t
 gc_mark_children(mrb_state *mrb, mrb_gc *gc, struct RBasic *obj)
 {
+  size_t children = 0;
+
   mrb_assert(is_gray(obj));
   paint_black(obj);
   mrb_gc_mark(mrb, (struct RBasic*)obj->c);
@@ -586,9 +590,11 @@ gc_mark_children(mrb_state *mrb, mrb_gc *gc, struct RBasic *obj)
   case MRB_TT_ICLASS:
     {
       struct RClass *c = (struct RClass*)obj;
-      if (MRB_FLAG_TEST(c, MRB_FL_CLASS_IS_ORIGIN))
-        mrb_gc_mark_mt(mrb, c);
+      if (MRB_FLAG_TEST(c, MRB_FL_CLASS_IS_ORIGIN)) {
+        children += mrb_gc_mark_mt(mrb, c);
+      }
       mrb_gc_mark(mrb, (struct RBasic*)((struct RClass*)obj)->super);
+      children++;
     }
     break;
 
@@ -600,12 +606,14 @@ gc_mark_children(mrb_state *mrb, mrb_gc *gc, struct RBasic *obj)
 
       mrb_gc_mark_mt(mrb, c);
       mrb_gc_mark(mrb, (struct RBasic*)c->super);
+      children += mrb_gc_mark_mt(mrb, c);
+      children++;
     }
     /* fall through */
 
   case MRB_TT_OBJECT:
   case MRB_TT_CDATA:
-    mrb_gc_mark_iv(mrb, (struct RObject*)obj);
+    children += mrb_gc_mark_iv(mrb, (struct RObject*)obj);
     break;
 
   case MRB_TT_PROC:
@@ -614,6 +622,7 @@ gc_mark_children(mrb_state *mrb, mrb_gc *gc, struct RBasic *obj)
 
       mrb_gc_mark(mrb, (struct RBasic*)p->upper);
       mrb_gc_mark(mrb, (struct RBasic*)p->e.env);
+      children+=2;
     }
     break;
 
@@ -621,13 +630,13 @@ gc_mark_children(mrb_state *mrb, mrb_gc *gc, struct RBasic *obj)
     {
       struct REnv *e = (struct REnv*)obj;
 
-      if (MRB_ENV_ONSTACK_P(e) && e->cxt && e->cxt->fib) {
-        mrb_gc_mark(mrb, (struct RBasic*)e->cxt->fib);
-      }
+      // The data stack must always be protected from GC regardless of the MRB_ENV_CLOSE flag.
+      // This is because the data stack is not protected if the fiber is GC'd.
       mrb_int len = MRB_ENV_LEN(e);
       for (mrb_int i=0; i<len; i++) {
         mrb_gc_mark_value(mrb, e->stack[i]);
       }
+      children += len;
     }
     break;
 
@@ -635,7 +644,20 @@ gc_mark_children(mrb_state *mrb, mrb_gc *gc, struct RBasic *obj)
     {
       struct mrb_context *c = ((struct RFiber*)obj)->cxt;
 
-      if (c) mark_context(mrb, c);
+      if (!c || c->status == MRB_FIBER_TERMINATED) break;
+      mark_context(mrb, c);
+      if (!c->ci) break;
+
+      /* mark stack */
+      size_t i = c->ci->stack - c->stbase;
+      i += mrb_ci_nregs(c->ci);
+      if (c->stbase + i > c->stend) i = c->stend - c->stbase;
+      children += i;
+
+      /* mark closure */
+      if (c->cibase) {
+        children += c->ci - c->cibase + 1;
+      }
     }
     break;
 
@@ -643,18 +665,19 @@ gc_mark_children(mrb_state *mrb, mrb_gc *gc, struct RBasic *obj)
   case MRB_TT_ARRAY:
     {
       struct RArray *a = (struct RArray*)obj;
-      size_t e=ARY_LEN(a);
+      size_t len = ARY_LEN(a);
       mrb_value *p = ARY_PTR(a);
 
-      for (size_t i=0; i<e; i++) {
+      for (size_t i=0; i<len; i++) {
         mrb_gc_mark_value(mrb, p[i]);
       }
+      children += len;
     }
     break;
 
   case MRB_TT_HASH:
-    mrb_gc_mark_iv(mrb, (struct RObject*)obj);
-    mrb_gc_mark_hash(mrb, (struct RHash*)obj);
+    children += mrb_gc_mark_iv(mrb, (struct RObject*)obj);
+    children += mrb_gc_mark_hash(mrb, (struct RHash*)obj);
     break;
 
   case MRB_TT_STRING:
@@ -665,27 +688,37 @@ gc_mark_children(mrb_state *mrb, mrb_gc *gc, struct RBasic *obj)
     break;
 
   case MRB_TT_RANGE:
-    mrb_gc_mark_range(mrb, (struct RRange*)obj);
+    children += mrb_gc_mark_range(mrb, (struct RRange*)obj);
     break;
 
   case MRB_TT_BREAK:
     {
       struct RBreak *brk = (struct RBreak*)obj;
       mrb_gc_mark_value(mrb, mrb_break_value_get(brk));
+      children++;
     }
     break;
 
   case MRB_TT_EXCEPTION:
-    mrb_gc_mark_iv(mrb, (struct RObject*)obj);
+    children += mrb_gc_mark_iv(mrb, (struct RObject*)obj);
     if (((struct RException*)obj)->mesg) {
       mrb_gc_mark(mrb, (struct RBasic*)((struct RException*)obj)->mesg);
+      children++;
     }
-    mrb_gc_mark(mrb, (struct RBasic*)((struct RException*)obj)->backtrace);
+    if (((struct RException*)obj)->backtrace) {
+      mrb_gc_mark(mrb, (struct RBasic*)((struct RException*)obj)->backtrace);
+      children++;
+    }
+    break;
+
+  case MRB_TT_BACKTRACE:
+    children += ((struct RBacktrace*)obj)->len;
     break;
 
   default:
     break;
   }
+  return children;
 }
 
 MRB_API void
@@ -729,13 +762,9 @@ obj_free(mrb_state *mrb, struct RBasic *obj, mrb_bool end)
     {
       struct REnv *e = (struct REnv*)obj;
 
-      if (MRB_ENV_ONSTACK_P(e)) {
-        /* cannot be freed */
-        e->stack = NULL;
-        break;
+      if (!MRB_ENV_ONSTACK_P(e)) {
+        mrb_free(mrb, e->stack);
       }
-      mrb_free(mrb, e->stack);
-      e->stack = NULL;
     }
     break;
 
@@ -743,7 +772,20 @@ obj_free(mrb_state *mrb, struct RBasic *obj, mrb_bool end)
     {
       struct mrb_context *c = ((struct RFiber*)obj)->cxt;
 
-      if (c != mrb->root_c) {
+      if (c && c != mrb->root_c) {
+        if (!end && c->status != MRB_FIBER_TERMINATED) {
+          mrb_callinfo *ci = c->ci;
+          mrb_callinfo *ce = c->cibase;
+
+          while (ce <= ci) {
+            struct REnv *e = ci->u.env;
+            if (e && !is_dead(&mrb->gc, (struct RBasic*)e) &&
+                e->tt == MRB_TT_ENV && MRB_ENV_ONSTACK_P(e)) {
+              mrb_env_unshare(mrb, e, TRUE);
+            }
+            ci--;
+          }
+        }
         mrb_free_context(mrb, c);
       }
     }
@@ -890,101 +932,6 @@ root_scan_phase(mrb_state *mrb, mrb_gc *gc)
   }
 }
 
-/* rough estimation of number of GC marks (non recursive) */
-static size_t
-gc_gray_counts(mrb_state *mrb, mrb_gc *gc, struct RBasic *obj)
-{
-  size_t children = 0;
-
-  switch (obj->tt) {
-  case MRB_TT_ICLASS:
-    children++;
-    break;
-
-  case MRB_TT_CLASS:
-  case MRB_TT_SCLASS:
-  case MRB_TT_MODULE:
-    {
-      struct RClass *c = (struct RClass*)obj;
-
-      children += mrb_gc_mark_iv_size(mrb, (struct RObject*)obj);
-      children += mrb_gc_mark_mt_size(mrb, c);
-      children++;
-    }
-    break;
-
-  case MRB_TT_OBJECT:
-  case MRB_TT_CDATA:
-    children += mrb_gc_mark_iv_size(mrb, (struct RObject*)obj);
-    break;
-
-  case MRB_TT_ENV:
-    children += MRB_ENV_LEN(obj);
-    break;
-
-  case MRB_TT_FIBER:
-    {
-      struct mrb_context *c = ((struct RFiber*)obj)->cxt;
-      size_t i;
-      mrb_callinfo *ci;
-
-      if (!c || c->status == MRB_FIBER_TERMINATED) break;
-      if (!c->ci) break;
-
-      /* mark stack */
-      i = c->ci->stack - c->stbase;
-      i += mrb_ci_nregs(c->ci);
-      if (c->stbase + i > c->stend) i = c->stend - c->stbase;
-      children += i;
-
-      /* mark closure */
-      if (c->cibase) {
-        for (i=0, ci = c->cibase; ci <= c->ci; i++, ci++)
-          ;
-      }
-      children += i;
-    }
-    break;
-
-  case MRB_TT_STRUCT:
-  case MRB_TT_ARRAY:
-    {
-      struct RArray *a = (struct RArray*)obj;
-      children += ARY_LEN(a);
-    }
-    break;
-
-  case MRB_TT_HASH:
-    children += mrb_gc_mark_iv_size(mrb, (struct RObject*)obj);
-    children += mrb_gc_mark_hash_size(mrb, (struct RHash*)obj);
-    break;
-
-  case MRB_TT_PROC:
-  case MRB_TT_RANGE:
-  case MRB_TT_BREAK:
-    children+=2;
-    break;
-
-  case MRB_TT_EXCEPTION:
-    children += mrb_gc_mark_iv_size(mrb, (struct RObject*)obj);
-    if (((struct RException*)obj)->mesg) {
-      children++;
-    }
-    if (((struct RException*)obj)->backtrace) {
-      children++;
-    }
-    break;
-
-  case MRB_TT_BACKTRACE:
-    children += ((struct RBacktrace*)obj)->len;
-    break;
-
-  default:
-    break;
-  }
-  return children;
-}
-
 static void
 gc_mark_gray_list(mrb_state *mrb, mrb_gc *gc) {
   while (gc->gray_list) {
@@ -1004,8 +951,7 @@ incremental_marking_phase(mrb_state *mrb, mrb_gc *gc, size_t limit)
     struct RBasic *obj = gc->gray_list;
     gc->gray_list = obj->gcnext;
     obj->gcnext = NULL;
-    gc_mark_children(mrb, gc, obj);
-    tried_marks += gc_gray_counts(mrb, gc, obj);
+    tried_marks += gc_mark_children(mrb, gc, obj);
   }
 
   return tried_marks;

@@ -117,7 +117,7 @@ class Enumerator
   def initialize(obj=NONE, meth=:each, *args, **kwd, &block)
     if block
       obj = Generator.new(&block)
-    elsif obj == NONE
+    elsif NONE.equal?(obj)
       raise ArgumentError, "wrong number of arguments (given 0, expected 1+)"
     end
 
@@ -595,7 +595,7 @@ class Enumerator
   def Enumerator.produce(init=NONE, &block)
     raise ArgumentError, "no block given" if block.nil?
     Enumerator.new do |y|
-      if init == NONE
+      if NONE.equal?(init)
         val = nil
       else
         val = init
@@ -659,8 +659,8 @@ module Kernel
   #       # => returns an Enumerator when called without a block
   #     enum.first(4) # => [1, 1, 1, 2]
   #
-  def to_enum(meth=:each, *args)
-    Enumerator.new self, meth, *args
+  def to_enum(meth=:each, *args, **kwd)
+    Enumerator.new self, meth, *args, **kwd
   end
   alias enum_for to_enum
 end

@@ -6,6 +6,7 @@
 
 #ifdef _MSC_VER
 # define _CRT_NONSTDC_NO_DEPRECATE
+# define WIN32_LEAN_AND_MEAN
 #endif
 
 #include <mruby.h>
@@ -272,6 +273,14 @@ mrb_gc_free_str(mrb_state *mrb, struct RString *str)
 # define ALIGNED_WORD_ACCESS 1
 #endif
 
+#ifdef MRB_64BIT
+#define bitint uint64_t
+#define MASK01 0x0101010101010101ull
+#else
+#define bitint uint32_t
+#define MASK01 0x01010101ul
+#endif
+
 #ifdef MRB_UTF8_STRING
 
 #define NOASCII(c) ((c) & 0x80)
@@ -324,62 +333,32 @@ search_nonascii(const char *p, const char *e)
   case 2:  if (NOASCII(*p)) return p; ++p;
   case 1:  if (NOASCII(*p)) return p; ++p;
            if (NOASCII(*p)) return p;
+  case 0:  break;
   }
   return e;
 }
 
 #else
 
-#ifdef MRB_64BIT
-# define NONASCII_MASK 0x8080808080808080ULL
-#else /* MRB_32BIT */
-# define NONASCII_MASK 0x80808080UL
-#endif
-
 static const char*
 search_nonascii(const char *p, const char *e)
 {
-  if (e - p >= sizeof(void*)) {
-#if ALIGNED_WORD_ACCESS
-    if ((uintptr_t)p % sizeof(void*)) {
-      int l = sizeof(void*) - (uintptr_t)p % sizeof(void*);
-      p += l;
-      switch (l) {
-#ifdef MRB_64BIT
-      case 7: if (p[-7]&0x80) return p-7;
-      case 6: if (p[-6]&0x80) return p-6;
-      case 5: if (p[-5]&0x80) return p-5;
-      case 4: if (p[-4]&0x80) return p-4;
-#endif
-      case 3: if (p[-3]&0x80) return p-3;
-      case 2: if (p[-2]&0x80) return p-2;
-      case 1: if (p[-1]&0x80) return p-1;
-      case 0: break;
-      }
-    }
-#endif
+  ptrdiff_t byte_len = e - p;
 
-    const uintptr_t *s = (uintptr_t*)p;
-    const uintptr_t *t = (uintptr_t*)(e - (sizeof(void*)-1));
+  const char *be = p + sizeof(bitint) * (byte_len / sizeof(bitint));
+  for (; p < be; p+=sizeof(bitint)) {
+    bitint t0;
 
-    for (;s < t; s++) {
-      if (*s & NONASCII_MASK) {
-        p = (const char*)s;
-        if (NOASCII(p[0])) return p+0;
-        if (NOASCII(p[1])) return p+1;
-        if (NOASCII(p[2])) return p+2;
-        if (NOASCII(p[3])) return p+3;
-#ifdef MRB_64BIT
-        if (NOASCII(p[4])) return p+4;
-        if (NOASCII(p[5])) return p+5;
-        if (NOASCII(p[6])) return p+6;
-        if (NOASCII(p[7])) return p+7;
-#endif
-      }
+    memcpy(&t0, p, sizeof(bitint));
+    const bitint t1 = t0 & (MASK01*0x80);
+    if (t1) {
+      e = p + sizeof(bitint)-1;
+      byte_len = sizeof(bitint)-1;
+      break;
     }
   }
-  switch (e - p) {
-  default:
+
+  switch (byte_len % sizeof(bitint)) {
 #ifdef MRB_64BIT
   case 7: if (e[-7]&0x80) return e-7;
   case 6: if (e[-6]&0x80) return e-6;
@@ -421,15 +400,39 @@ mrb_utf8len(const char* p, const char* e)
   return len;
 }
 
+#if defined(__GNUC__) || __has_builtin(__builtin_popcount)
+# ifdef MRB_64BIT
+# define popcount(x) __builtin_popcountll(x)
+# else
+# define popcount(x) __builtin_popcountl(x)
+# endif
+#else
+static inline uint32_t popcount(bitint x)
+{
+  x = (x & (MASK01*0x55)) + ((x >>  1) & (MASK01*0x55));
+  x = (x & (MASK01*0x33)) + ((x >>  2) & (MASK01*0x33));
+  x = (x & (MASK01*0x0F)) + ((x >>  4) & (MASK01*0x0F));
+  return (x * MASK01) >> 56;
+}
+#endif
+
 mrb_int
 mrb_utf8_strlen(const char *str, mrb_int byte_len)
 {
-  mrb_int len = 0;
   const char *p = str;
-  const char *e = p + byte_len;
+  const char *e = str + byte_len;
+  mrb_int len = 0;
+
   while (p < e) {
-    if (utf8_islead(*p)) len++;
-    p++;
+    const char *np = search_nonascii(p, e);
+
+    len += np - p;
+    if (np == e) break;
+    p = np;
+    while (NOASCII(*p)) {
+      p += mrb_utf8len(p, e);
+      len++;
+    }
   }
   return len;
 }
@@ -445,6 +448,7 @@ utf8_strlen(mrb_value str)
   }
   else {
     mrb_int utf8_len = mrb_utf8_strlen(RSTR_PTR(s), byte_len);
+    mrb_assert(utf8_len <= byte_len);
     if (byte_len == utf8_len) RSTR_SET_SINGLE_BYTE_FLAG(s);
     return utf8_len;
   }
@@ -498,10 +502,11 @@ bytes2chars(mrb_value s, mrb_int bi)
   }
 
   const char *p = RSTRING_PTR(s);
+  const char *e = p + RSTRING_LEN(s);
   const char *pivot = p + bi;
   mrb_int i = 0;
 
-  if (RSTRING_END(s) < pivot) return -1;
+  if (e < pivot) return -1;
   while (p < pivot) {
     if ((*p & 0x80) == 0) {
       const char *np = search_nonascii(p, pivot);
@@ -509,7 +514,7 @@ bytes2chars(mrb_value s, mrb_int bi)
       p = np;
     }
     else {
-      p += mrb_utf8len(p, pivot);
+      p += mrb_utf8len(p, e);
       i++;
     }
   }
@@ -580,29 +585,20 @@ str_index_str_by_char(mrb_state *mrb, mrb_value str, mrb_value sub, mrb_int pos)
 static inline mrb_int
 memsearch_swar(const char *xs, mrb_int m, const char *ys, mrb_int n)
 {
-#ifdef MRB_64BIT
-#define bitint uint64_t
-#define MASK1 0x0101010101010101ull
-#define MASK2 0x7f7f7f7f7f7f7f7full
-#define MASK3 0x8080808080808080ull
-#else
-#define bitint uint32_t
-#define MASK1 0x01010101ul
-#define MASK2 0x7f7f7f7ful
-#define MASK3 0x80808080ul
-#endif
+#define MASK7f (MASK01*0x7f)
+#define MASK80 (MASK01*0x80)
 #if defined(MRB_ENDIAN_BIG)
 #ifdef MRB_64BIT
-#define MASK4 0x8000000000000000ull
+#define MASKtop 0x8000000000000000ull
 #else
-#define MASK4 0x80000000ul
+#define MASKtop 0x80000000ul
 #endif
 #else
-#define MASK4 0x80
+#define MASKtop 0x80
 #endif
 
-  const bitint first = MASK1 * (uint8_t)xs[0];
-  const bitint last  = MASK1 * (uint8_t)xs[m-1];
+  const bitint first = MASK01 * (uint8_t)xs[0];
+  const bitint last  = MASK01 * (uint8_t)xs[m-1];
 
   const char *s0 = ys;
   const char *s1 = ys+m-1;
@@ -617,11 +613,10 @@ memsearch_swar(const char *xs, mrb_int m, const char *ys, mrb_int n)
     memcpy(&t1, s1+i, sizeof(bitint));
 
     const bitint eq = (t0 ^ first) | (t1 ^ last);
-    bitint zeros = ((~eq & MASK2) + MASK1) & (~eq & MASK3);
-
+    bitint zeros = ((~eq & MASK7f) + MASK01) & (~eq & MASK80);
 
     for (size_t j = 0; zeros; j++) {
-      if (zeros & MASK4) {
+      if (zeros & MASKtop) {
         const mrb_int idx = i + j;
         const char* p = s0 + idx + 1;
         if (memcmp(p, xs + 1, m - 2) == 0) {
@@ -640,9 +635,8 @@ memsearch_swar(const char *xs, mrb_int m, const char *ys, mrb_int n)
   if (i+m < n) {
     const char *p = s0;
     const char *e = ys + n;
-    for (;p<e;) {
-      size_t len = e - p;
-      p = (const char*)memchr(p, *xs, len);
+    while (p<e) {
+      p = (const char*)memchr(p, *xs, e - p);
       if (p == NULL || (e - p) < m) break;
       if (memcmp(p+1, xs+1, m-1) == 0) return (mrb_int)(p - ys);
       p++;
@@ -699,10 +693,9 @@ str_share(mrb_state *mrb, struct RString *orig, struct RString *s)
 mrb_value
 mrb_str_byte_subseq(mrb_state *mrb, mrb_value str, mrb_int beg, mrb_int len)
 {
-  struct RString *orig, *s;
+  struct RString *orig = mrb_str_ptr(str);
+  struct RString *s = mrb_obj_alloc_string(mrb);
 
-  orig = mrb_str_ptr(str);
-  s = mrb_obj_alloc_string(mrb);
   if (RSTR_EMBEDDABLE_P(len)) {
     str_init_embed(s, RSTR_PTR(orig)+beg, len);
   }
@@ -753,24 +746,23 @@ str_substr(mrb_state *mrb, mrb_value str, mrb_int beg, mrb_int len)
 MRB_API mrb_int
 mrb_str_index(mrb_state *mrb, mrb_value str, const char *sptr, mrb_int slen, mrb_int offset)
 {
-  mrb_int pos;
-  char *s;
-  mrb_int len;
+  mrb_int len = RSTRING_LEN(str);
 
-  len = RSTRING_LEN(str);
   if (offset < 0) {
     offset += len;
     if (offset < 0) return -1;
   }
   if (len - offset < slen) return -1;
-  s = RSTRING_PTR(str);
+
+  char *s = RSTRING_PTR(str);
   if (offset) {
     s += offset;
   }
   if (slen == 0) return offset;
   /* need proceed one character at a time */
   len = RSTRING_LEN(str) - offset;
-  pos = mrb_memsearch(sptr, slen, s, len);
+
+  mrb_int pos = mrb_memsearch(sptr, slen, s, len);
   if (pos < 0) return pos;
   return pos + offset;
 }
@@ -778,11 +770,8 @@ mrb_str_index(mrb_state *mrb, mrb_value str, const char *sptr, mrb_int slen, mrb
 static mrb_int
 str_index_str(mrb_state *mrb, mrb_value str, mrb_value str2, mrb_int offset)
 {
-  const char *ptr;
-  mrb_int len;
-
-  ptr = RSTRING_PTR(str2);
-  len = RSTRING_LEN(str2);
+  const char *ptr = RSTRING_PTR(str2);
+  mrb_int len = RSTRING_LEN(str2);
 
   return mrb_str_index(mrb, str, ptr, len, offset);
 }
@@ -790,20 +779,17 @@ str_index_str(mrb_state *mrb, mrb_value str, mrb_value str2, mrb_int offset)
 static mrb_value
 str_replace(mrb_state *mrb, struct RString *s1, struct RString *s2)
 {
-  size_t len;
-
   mrb_check_frozen(mrb, s1);
   if (s1 == s2) return mrb_obj_value(s1);
   RSTR_COPY_SINGLE_BYTE_FLAG(s1, s2);
   if (RSTR_SHARED_P(s1)) {
     str_decref(mrb, s1->as.heap.aux.shared);
   }
-  else if (!RSTR_EMBED_P(s1) && !RSTR_NOFREE_P(s1) && !RSTR_FSHARED_P(s1)
-           && s1->as.heap.ptr) {
+  else if (!RSTR_EMBED_P(s1) && !RSTR_NOFREE_P(s1) && !RSTR_FSHARED_P(s1)) {
     mrb_free(mrb, s1->as.heap.ptr);
   }
 
-  len = (size_t)RSTR_LEN(s2);
+  size_t len = (size_t)RSTR_LEN(s2);
   if (RSTR_EMBEDDABLE_P(len)) {
     str_init_embed(s1, RSTR_PTR(s2), len);
   }
@@ -847,6 +833,8 @@ str_rindex(mrb_state *mrb, mrb_value str, mrb_value sub, mrb_int pos)
 }
 
 #ifdef _WIN32
+#include <stdlib.h>
+#include <malloc.h>
 #include <windows.h>
 
 char*
@@ -1018,8 +1006,7 @@ mrb_str_size(mrb_state *mrb, mrb_value self)
 static mrb_value
 mrb_str_bytesize(mrb_state *mrb, mrb_value self)
 {
-  mrb_int len = RSTRING_LEN(self);
-  return mrb_int_value(mrb, len);
+  return mrb_int_value(mrb, RSTRING_LEN(self));
 }
 
 /* 15.2.10.5.1  */
@@ -1035,9 +1022,7 @@ mrb_str_bytesize(mrb_state *mrb, mrb_value self)
 static mrb_value
 mrb_str_times(mrb_state *mrb, mrb_value self)
 {
-  mrb_int n, len, times;
-  struct RString *str2;
-  char *p;
+  mrb_int len, times;
 
   mrb_get_args(mrb, "i", &times);
   if (times < 0) {
@@ -1046,10 +1031,11 @@ mrb_str_times(mrb_state *mrb, mrb_value self)
   if (mrb_int_mul_overflow(RSTRING_LEN(self), times, &len)) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "argument too big");
   }
-  str2 = str_new(mrb, 0, len);
-  p = RSTR_PTR(str2);
+
+  struct RString *str2 = str_new(mrb, 0, len);
+  char *p = RSTR_PTR(str2);
   if (len > 0) {
-    n = RSTRING_LEN(self);
+    mrb_int n = RSTRING_LEN(self);
     memcpy(p, RSTRING_PTR(self), n);
     while (n <= len/2) {
       memcpy(p + n, p, n);
@@ -1077,15 +1063,13 @@ mrb_str_times(mrb_state *mrb, mrb_value self)
 MRB_API int
 mrb_str_cmp(mrb_state *mrb, mrb_value str1, mrb_value str2)
 {
-  mrb_int len, len1, len2;
-  mrb_int retval;
   struct RString *s1 = mrb_str_ptr(str1);
   struct RString *s2 = mrb_str_ptr(str2);
 
-  len1 = RSTR_LEN(s1);
-  len2 = RSTR_LEN(s2);
-  len = lesser(len1, len2);
-  retval = memcmp(RSTR_PTR(s1), RSTR_PTR(s2), len);
+  mrb_int len1 = RSTR_LEN(s1);
+  mrb_int len2 = RSTR_LEN(s2);
+  mrb_int len = lesser(len1, len2);
+  mrb_int retval = memcmp(RSTR_PTR(s1), RSTR_PTR(s2), len);
   if (retval == 0) {
     if (len1 == len2) return 0;
     if (len1 > len2)  return 1;
@@ -1125,14 +1109,12 @@ static mrb_value
 mrb_str_cmp_m(mrb_state *mrb, mrb_value str1)
 {
   mrb_value str2 = mrb_get_arg1(mrb);
-  mrb_int result;
 
   if (!mrb_string_p(str2)) {
     return mrb_nil_value();
   }
-  else {
-    result = mrb_str_cmp(mrb, str1, str2);
-  }
+
+  mrb_int result = mrb_str_cmp(mrb, str1, str2);
   return mrb_int_value(mrb, result);
 }
 
@@ -1142,9 +1124,7 @@ str_eql(mrb_state *mrb, const mrb_value str1, const mrb_value str2)
   const mrb_int len = RSTRING_LEN(str1);
 
   if (len != RSTRING_LEN(str2)) return FALSE;
-  if (memcmp(RSTRING_PTR(str1), RSTRING_PTR(str2), (size_t)len) == 0)
-    return TRUE;
-  return FALSE;
+  return (memcmp(RSTRING_PTR(str1), RSTRING_PTR(str2), (size_t)len) == 0);
 }
 
 MRB_API mrb_bool
@@ -1802,9 +1782,7 @@ static mrb_value
 mrb_str_eql(mrb_state *mrb, mrb_value self)
 {
   mrb_value str2 = mrb_get_arg1(mrb);
-  mrb_bool eql_p;
-
-  eql_p = (mrb_string_p(str2)) && str_eql(mrb, self, str2);
+  mrb_bool eql_p = (mrb_string_p(str2)) && str_eql(mrb, self, str2);
 
   return mrb_bool_value(eql_p);
 }
@@ -2735,7 +2713,7 @@ bad:
       mrb_raisef(mrb, E_ARGUMENT_ERROR, "invalid string for float(%!s)", s);
       /* not reached */
     }
-    return d;
+    return 0.0;
   }
   if (badcheck) {
     if (!end || p == end) goto bad;

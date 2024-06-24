@@ -358,6 +358,10 @@ range_num_to_a(mrb_state *mrb, mrb_value range)
     if (mrb_integer_p(end)) {
       mrb_int a = mrb_integer(beg);
       mrb_int b = mrb_integer(end);
+
+      if (a > b) {
+        return mrb_ary_new_capa(mrb, 0);
+      }
       mrb_int len;
 
       if (mrb_int_sub_overflow(b, a, &len)) {
@@ -437,13 +441,13 @@ mrb_get_values_at(mrb_state *mrb, mrb_value obj, mrb_int olen, mrb_int argc, con
   return result;
 }
 
-void
+size_t
 mrb_gc_mark_range(mrb_state *mrb, struct RRange *r)
 {
-  if (RANGE_INITIALIZED_P(r)) {
-    mrb_gc_mark_value(mrb, RANGE_BEG(r));
-    mrb_gc_mark_value(mrb, RANGE_END(r));
-  }
+  if (!RANGE_INITIALIZED_P(r)) return 0;
+  mrb_gc_mark_value(mrb, RANGE_BEG(r));
+  mrb_gc_mark_value(mrb, RANGE_END(r));
+  return 2;
 }
 
 MRB_API struct RRange*
